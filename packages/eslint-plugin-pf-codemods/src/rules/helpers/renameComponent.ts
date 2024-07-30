@@ -8,7 +8,14 @@ import {
   JSXOpeningElement,
   JSXSpreadAttribute,
   ImportSpecifier,
+  Identifier,
+  JSXClosingElement,
+  ImportDefaultSpecifier,
 } from "estree-jsx";
+import {
+  ImportDefaultSpecifierWithParent,
+  JSXOpeningElementWithParent,
+} from "./interfaces";
 
 interface ComponentRename {
   newName: string;
@@ -25,11 +32,30 @@ function formatDefaultMessage(oldName: string, newName: string) {
   return `${oldName} has been renamed to ${newName}.`;
 }
 
-function getName(node: JSXOpeningElement | JSXMemberExpression) {
+function getDeclarationString(
+  defaultImportSpecifier: ImportDefaultSpecifierWithParent
+) {
+  return defaultImportSpecifier?.parent?.source.value?.toString();
+}
+
+function getComponentImportName(
+  importSpecifier: ImportSpecifier | ImportDefaultSpecifierWithParent,
+  potentialNames: string[]
+) {
+  if (importSpecifier.type === "ImportSpecifier") {
+    return importSpecifier.imported.name;
+  }
+
+  return potentialNames.find((name) =>
+    getDeclarationString(importSpecifier)?.includes(name)
+  );
+}
+
+function getNodeName(node: JSXOpeningElement | JSXMemberExpression) {
   if (node.type === "JSXMemberExpression") {
     switch (node.object.type) {
       case "JSXMemberExpression":
-        return getName(node.object);
+        return getNodeName(node.object);
       case "JSXIdentifier":
         return node.object.name;
     }
@@ -37,7 +63,7 @@ function getName(node: JSXOpeningElement | JSXMemberExpression) {
 
   switch (node.name.type) {
     case "JSXMemberExpression":
-      return getName(node.name);
+      return getNodeName(node.name);
     case "JSXIdentifier":
     case "JSXNamespacedName":
       return typeof node.name.name === "string"
@@ -65,51 +91,96 @@ function hasCodeModDataTag(openingElement: JSXOpeningElement) {
   return attributeNames.includes("data-codemods");
 }
 
+function getFixes(
+  fixer: Rule.RuleFixer,
+  nodeImport: ImportSpecifier | ImportDefaultSpecifierWithParent,
+  node: JSXOpeningElementWithParent,
+  oldName: string,
+  newName: string
+) {
+  const fixes = [];
+
+  const isNamedImport = nodeImport.type === "ImportSpecifier";
+  if (isNamedImport) {
+    fixes.push(fixer.replaceText(nodeImport.imported, newName));
+  } else {
+    const importDeclaration = nodeImport.parent;
+    const newImportDeclaration = importDeclaration?.source.raw?.replace(
+      oldName,
+      newName
+    );
+    if (importDeclaration && newImportDeclaration) {
+      fixes.push(
+        fixer.replaceText(importDeclaration.source, newImportDeclaration)
+      );
+    }
+  }
+
+  const shouldRenameNode =
+    isNamedImport && nodeImport.imported.name === nodeImport.local.name;
+
+  if (shouldRenameNode) {
+    fixes.push(fixer.replaceText(node.name, newName));
+    fixes.push(fixer.insertTextAfter(node.name, " data-codemods"));
+  }
+
+  const closingElement = node?.parent?.closingElement;
+  if (shouldRenameNode && closingElement) {
+    fixes.push(fixer.replaceText(closingElement.name, newName));
+  }
+
+  return fixes;
+}
+
 export function renameComponent(
   renames: ComponentRenames,
   packageName = "@patternfly/react-core"
 ) {
   return function (context: Rule.RuleContext) {
-    const imports = getAllImportsFromPackage(
-      context,
-      packageName,
-      Object.keys(renames)
-    );
+    const oldNames = Object.keys(renames);
+    const imports = getAllImportsFromPackage(context, packageName, oldNames);
 
     if (imports.length === 0) {
       return {};
     }
 
     return {
-      JSXOpeningElement(node: JSXOpeningElement) {
-        const oldName = getName(node);
+      JSXOpeningElement(node: JSXOpeningElementWithParent) {
+        if (hasCodeModDataTag(node)) {
+          return;
+        }
+
+        const nodeName = getNodeName(node);
+        const nodeImport = imports.find((imp) => {
+          if (imp.type === "ImportSpecifier") {
+            return [imp.imported.name, imp.local.name].includes(nodeName);
+          }
+
+          return oldNames.some((name) =>
+            getDeclarationString(imp)?.includes(name)
+          );
+        });
+
+        if (!nodeImport) {
+          return;
+        }
+
+        const oldName = getComponentImportName(nodeImport, oldNames);
+
+        if (!oldName) {
+          return;
+        }
+
         const newName = renames[oldName];
 
         if (!newName) {
           return;
         }
 
-        if (hasCodeModDataTag(node)) {
-          return;
-        }
-
-        const nodeImport = imports.find(
-          (imp) =>
-            imp.type === "ImportSpecifier" && imp.imported.name === oldName
-        );
-
         context.report({
           node,
           message: formatDefaultMessage(oldName, newName),
-          fix: (fixer) => {
-            return [
-              fixer.replaceText(node.name, newName),
-              fixer.replaceText(
-                (nodeImport as ImportSpecifier).imported,
-                newName
-              ),
-            ];
-          },
+          fix: (fixer) => getFixes(fixer, nodeImport, node, oldName, newName),
         });
       },
     };
